@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧠 MindGuard
+# 🧠 [MindGuard](https://mindguard-wellbeing.vercel.app)
 ### *A Digital Sanctuary for Student Well-Being*
 
 [![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js&logoColor=white)](https://nextjs.org/)
