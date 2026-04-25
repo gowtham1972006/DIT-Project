@@ -1,45 +1,125 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { useRouter, useParams } from 'next/navigation';
-import io from 'socket.io-client';
+
+// ─── Polling intervals ────────────────────────────────────────────────────────
+const MSG_POLL_MS   = 2000; // poll for new messages every 2 s
+const STATUS_POLL_MS = 3000; // poll for status change every 3 s (waiting phase)
 
 export default function SharedChatPage() {
-  const router = useRouter();
-  const params = useParams();
+  const router   = useRouter();
+  const params   = useParams();
   const sessionId = params.sessionId;
 
-  // Connection states
-  const [sessionInfo, setSessionInfo] = useState(null);
-  const [connectionStatus, setConnectionStatus] = useState('connecting'); // connecting, waiting, active, closed, error
-  const [errorMsg, setErrorMsg] = useState('');
-  
-  // Chat states
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [otherTyping, setOtherTyping] = useState(false);
-  const scrollRef = useRef(null);
-  const socketRef = useRef(null);
-  const typingTimeoutRef = useRef(null);
+  // ── State ────────────────────────────────────────────────────────────────────
+  const [sessionInfo,       setSessionInfo]       = useState(null);
+  const [connectionStatus,  setConnectionStatus]  = useState('connecting');
+  // connecting → waiting | active | closed | error
+  const [errorMsg,          setErrorMsg]           = useState('');
+  const [messages,          setMessages]           = useState([]);
+  const [input,             setInput]              = useState('');
+  const [sending,           setSending]            = useState(false);
 
-  // Auto-scroll
+  // ── Refs ─────────────────────────────────────────────────────────────────────
+  const scrollRef        = useRef(null);
+  const lastTimestampRef = useRef(null); // ISO string — newest message we've seen
+  const msgPollRef       = useRef(null);
+  const statusPollRef    = useRef(null);
+  const viewerRoleRef    = useRef(null); // keep role stable across poll closures
+
+  // ── Auto-scroll ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, otherTyping]);
+  }, [messages]);
 
-  // Load history and connect socket
+  // ── Message poll ─────────────────────────────────────────────────────────────
+  const startMsgPoll = useCallback(() => {
+    if (msgPollRef.current) return; // already running
+    msgPollRef.current = setInterval(async () => {
+      try {
+        const since = lastTimestampRef.current
+          ? `?since=${encodeURIComponent(lastTimestampRef.current)}`
+          : '';
+        const res  = await fetch(`/api/peer-session/${sessionId}/messages${since}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Sync status from server (handles session_ended scenario)
+        if (data.status === 'closed') {
+          setConnectionStatus('closed');
+          stopPolling();
+        }
+
+        if (data.messages && data.messages.length > 0) {
+          setMessages((prev) => {
+            const existingIds = new Set(prev.map((m) => m.id));
+            const incoming    = data.messages.filter((m) => !existingIds.has(m.id));
+            if (incoming.length === 0) return prev;
+
+            // Play sound for incoming messages from the other party
+            incoming.forEach((m) => {
+              if (m.sender_role !== viewerRoleRef.current) playNotificationSound();
+            });
+
+            // Track the newest timestamp
+            const newest = incoming[incoming.length - 1].timestamp;
+            lastTimestampRef.current = newest;
+            return [...prev, ...incoming];
+          });
+        }
+      } catch {
+        // Network hiccup — silently retry next interval
+      }
+    }, MSG_POLL_MS);
+  }, [sessionId]);
+
+  // ── Status poll (waiting phase only) ────────────────────────────────────────
+  const startStatusPoll = useCallback(() => {
+    if (statusPollRef.current) return;
+    statusPollRef.current = setInterval(async () => {
+      try {
+        const res  = await fetch(`/api/peer-session/${sessionId}/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (data.status === 'active') {
+          setConnectionStatus('active');
+          setMessages((prev) => [
+            ...prev,
+            { id: 'sys-' + Date.now(), isSystem: true, content: 'A peer supporter has connected. You can now chat.' },
+          ]);
+          stopStatusPoll();
+          startMsgPoll();
+        } else if (data.status === 'closed') {
+          setConnectionStatus('closed');
+          stopPolling();
+        }
+      } catch {
+        // ignore
+      }
+    }, STATUS_POLL_MS);
+  }, [sessionId, startMsgPoll]);
+
+  const stopMsgPoll = () => {
+    if (msgPollRef.current) { clearInterval(msgPollRef.current); msgPollRef.current = null; }
+  };
+  const stopStatusPoll = () => {
+    if (statusPollRef.current) { clearInterval(statusPollRef.current); statusPollRef.current = null; }
+  };
+  const stopPolling = () => { stopMsgPoll(); stopStatusPoll(); };
+
+  // ── Initial load ─────────────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
 
-    async function initRoom() {
+    async function init() {
       try {
-        // 1. Fetch history + auth check via REST
-        const res = await fetch(`/api/peer-session/${sessionId}`);
+        const res  = await fetch(`/api/peer-session/${sessionId}`);
         const data = await res.json();
-        
         if (!mounted) return;
 
         if (!res.ok) {
@@ -48,161 +128,135 @@ export default function SharedChatPage() {
           return;
         }
 
+        viewerRoleRef.current = data.viewer_role;
+
         setSessionInfo({
-          viewerRole: data.viewer_role, // 'student' or 'peer'
-          topic: data.session.topic,
-          isPeer: data.viewer_role === 'peer',
-          label: data.viewer_label,
-          anonId: data.session.student_anon_id,
+          viewerRole: data.viewer_role,
+          topic:      data.session.topic,
+          isPeer:     data.viewer_role === 'peer',
+          label:      data.viewer_label,
+          anonId:     data.session.student_anon_id,
         });
-        
-        setMessages(data.messages || []);
-        
+
+        // Seed history
+        if (data.messages && data.messages.length > 0) {
+          setMessages(data.messages);
+          lastTimestampRef.current = data.messages[data.messages.length - 1].timestamp;
+        }
+
         if (data.session.status === 'closed') {
           setConnectionStatus('closed');
-          return; // Don't connect socket if closed
+          return;
         }
 
         setConnectionStatus(data.session.status); // 'waiting' or 'active'
 
-        // 2. Connect Socket.io (no URL means same origin)
-        const socket = io();
-        socketRef.current = socket;
-
-        socket.on('connect', () => {
-          socket.emit('join_room', { session_id: sessionId });
-        });
-
-        socket.on('room_joined', ({ status }) => {
-          setConnectionStatus(status);
-        });
-
-        socket.on('peer_joined', ({ message }) => {
-          setConnectionStatus('active');
-          // Add a system message locally
-          setMessages(prev => [...prev, { id: 'sys-'+Date.now(), isSystem: true, content: message }]);
-        });
-
-        socket.on('receive_message', (msg) => {
-          setMessages(prev => {
-            // Deduplicate just in case
-            if (prev.some(m => m.id === msg.id)) return prev;
-            
-            // Play sound if the message is from the other user
-            if (msg.sender_role !== data.viewer_role) {
-              playNotificationSound();
-            }
-            
-            return [...prev, msg];
-          });
-          setOtherTyping(false);
-        });
-
-        socket.on('user_typing', ({ role }) => {
-          if (role !== data.viewer_role) setOtherTyping(true);
-        });
-
-        socket.on('user_stop_typing', () => {
-          setOtherTyping(false);
-        });
-
-        socket.on('session_ended', ({ message }) => {
-          setConnectionStatus('closed');
-          setMessages(prev => [...prev, { id: 'sys-'+Date.now(), isSystem: true, content: message }]);
-          if (socketRef.current) socketRef.current.disconnect();
-        });
-
-        socket.on('user_disconnected', ({ message }) => {
-          setMessages(prev => [...prev, { id: 'sys-'+Date.now(), isSystem: true, content: message }]);
-        });
-
-        socket.on('error_msg', (msg) => {
-          console.error("Socket error:", msg);
-          // Optional: handle visual error state
-        });
-
-      } catch (err) {
+        if (data.session.status === 'active') {
+          startMsgPoll();
+        } else {
+          // waiting — poll status until peer joins, then switch to msg poll
+          startStatusPoll();
+        }
+      } catch {
         if (mounted) {
           setConnectionStatus('error');
-          setErrorMsg('Network error.');
+          setErrorMsg('Network error. Please try again.');
         }
       }
     }
 
-    initRoom();
+    init();
 
     return () => {
       mounted = false;
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
+      stopPolling();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  // Web Audio API — Soft Pop Notification
+  // ── Peer joining their own session: skip waiting, go straight to msg poll ────
+  useEffect(() => {
+    if (sessionInfo?.isPeer && connectionStatus === 'waiting') {
+      // Peer accepted the session from the queue — already in status 'waiting'
+      // but after PATCH /status?action=join it will flip to 'active'.
+      // The status poll above handles that transition.
+    }
+  }, [sessionInfo, connectionStatus]);
+
+  // ── Audio notification ───────────────────────────────────────────────────────
   const playNotificationSound = () => {
     try {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContext) return;
-      const ctx = new AudioContext();
-      const osc = ctx.createOscillator();
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx  = new Ctx();
+      const osc  = ctx.createOscillator();
       const gain = ctx.createGain();
-      
       osc.type = 'sine';
       osc.frequency.setValueAtTime(440, ctx.currentTime);
       osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1);
-      
       gain.gain.setValueAtTime(0, ctx.currentTime);
       gain.gain.linearRampToValueAtTime(0.5, ctx.currentTime + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
-      
       osc.connect(gain);
       gain.connect(ctx.destination);
-      
       osc.start(ctx.currentTime);
       osc.stop(ctx.currentTime + 0.15);
-    } catch(e) {
-      // Ignore audio errors (e.g. browser autoplay policies)
-    }
+    } catch { /* ignore */ }
   };
 
-  // Handle typing event
-  const handleTyping = (e) => {
-    setInput(e.target.value);
-    
-    if (socketRef.current && connectionStatus === 'active') {
-      socketRef.current.emit('typing', { session_id: sessionId });
-      
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-      typingTimeoutRef.current = setTimeout(() => {
-        socketRef.current.emit('stop_typing', { session_id: sessionId });
-      }, 1500);
-    }
-  };
-
-  const sendMessage = (e) => {
+  // ── Send message ─────────────────────────────────────────────────────────────
+  const sendMessage = async (e) => {
     e.preventDefault();
-    if (!input.trim() || connectionStatus !== 'active' || !socketRef.current) return;
+    const text = input.trim();
+    if (!text || connectionStatus !== 'active' || sending) return;
 
-    socketRef.current.emit('send_message', {
-      session_id: sessionId,
-      content: input,
-    });
-    
-    socketRef.current.emit('stop_typing', { session_id: sessionId });
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    setSending(true);
     setInput('');
-  };
 
-  const endSession = () => {
-    if (confirm('Are you sure you want to end this session? It will be closed permanently.')) {
-      if (socketRef.current) {
-        socketRef.current.emit('end_session', { session_id: sessionId });
+    try {
+      const res  = await fetch(`/api/peer-session/${sessionId}/messages`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ content: text }),
+      });
+      if (!res.ok) {
+        setInput(text); // restore on failure
+        return;
       }
-      setTimeout(() => router.push('/dashboard'), 500);
+      const saved = await res.json();
+      // Optimistically add own message (poll deduplicates by id)
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === saved.id)) return prev;
+        lastTimestampRef.current = saved.timestamp;
+        return [...prev, saved];
+      });
+    } catch {
+      setInput(text);
+    } finally {
+      setSending(false);
     }
   };
 
+  // ── End session ──────────────────────────────────────────────────────────────
+  const endSession = async () => {
+    if (!confirm('Are you sure you want to end this session? It will be closed permanently.')) return;
+    try {
+      await fetch(`/api/peer-session/${sessionId}/status`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ action: 'end' }),
+      });
+    } catch { /* ignore */ }
+    stopPolling();
+    setConnectionStatus('closed');
+    setMessages((prev) => [
+      ...prev,
+      { id: 'sys-end-' + Date.now(), isSystem: true, content: 'The session has ended.' },
+    ]);
+    setTimeout(() => router.push(sessionInfo?.isPeer ? '/peer' : '/dashboard'), 1500);
+  };
+
+  // ── Render states ─────────────────────────────────────────────────────────────
   if (connectionStatus === 'error') {
     return (
       <main className="container mt-8 fade-in text-center">
@@ -221,7 +275,7 @@ export default function SharedChatPage() {
     );
   }
 
-  const isPeer = sessionInfo?.isPeer;
+  const isPeer   = sessionInfo?.isPeer;
   const backLink = isPeer ? '/peer' : '/dashboard';
 
   return (
@@ -230,9 +284,9 @@ export default function SharedChatPage() {
         <Link href={backLink} className="text-secondary" style={{ textDecoration: 'none' }}>
           &larr; Back
         </Link>
-        <button 
-          onClick={endSession} 
-          className="btn-outline" 
+        <button
+          onClick={endSession}
+          className="btn-outline"
           style={{ padding: '0.25rem 0.75rem', fontSize: '0.875rem' }}
           disabled={connectionStatus === 'closed'}
         >
@@ -241,38 +295,41 @@ export default function SharedChatPage() {
       </div>
 
       <div className="card flex-col w-full h-full p-0 overflow-hidden mx-auto max-w-2xl" style={{ flexGrow: 1, display: 'flex' }}>
-        
+
         {/* Header */}
         <div style={{ padding: '1.25rem 1.5rem', borderBottom: '1px solid var(--border-color)', backgroundColor: 'var(--bg-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
           <div>
             <h2 className="text-primary m-0">Peer Support Chat</h2>
             <p className="text-secondary m-0" style={{ fontSize: '0.85rem' }}>
-              {isPeer ? `Chatting with: ${sessionInfo.anonId} (${sessionInfo.topic})` : 'You are completely anonymous.'}
+              {isPeer
+                ? `Chatting with: ${sessionInfo.anonId} (${sessionInfo.topic})`
+                : 'You are completely anonymous.'}
             </p>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <div style={{ 
-              width: '10px', height: '10px', borderRadius: '50%', 
-              backgroundColor: connectionStatus === 'active' ? 'var(--success)' : 
-                               connectionStatus === 'waiting' ? '#f0a500' : 'var(--text-secondary)'
-            }}></div>
+            <div style={{
+              width: '10px', height: '10px', borderRadius: '50%',
+              backgroundColor:
+                connectionStatus === 'active'  ? 'var(--success)' :
+                connectionStatus === 'waiting' ? '#f0a500' : 'var(--text-secondary)',
+            }} />
             <span className="text-secondary" style={{ fontSize: '0.875rem' }}>
-              {connectionStatus === 'active' ? 'Connected' : 
+              {connectionStatus === 'active'  ? 'Connected' :
                connectionStatus === 'waiting' ? 'Waiting for Peer...' : 'Closed'}
             </span>
           </div>
         </div>
 
-        {/* Message Area */}
+        {/* Message area */}
         <div ref={scrollRef} style={{ flexGrow: 1, overflowY: 'auto', padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          
+
           {messages.length === 0 && connectionStatus === 'waiting' && !isPeer && (
             <div className="text-center text-secondary my-8">
               A peer supporter will join shortly. Hang tight...
             </div>
           )}
 
-          {messages.map((msg, i) => {
+          {messages.map((msg) => {
             if (msg.isSystem) {
               return (
                 <div key={msg.id} className="text-center text-secondary fade-in" style={{ fontSize: '0.8rem', fontStyle: 'italic', margin: '1rem 0' }}>
@@ -281,57 +338,53 @@ export default function SharedChatPage() {
               );
             }
 
-            const isMine = msg.sender_role === sessionInfo.viewerRole;
-            
+            const isMine = msg.sender_role === sessionInfo?.viewerRole;
             return (
-              <div key={msg.id} className="fade-in" style={{ 
-                alignSelf: isMine ? 'flex-end' : 'flex-start',
-                maxWidth: '85%',
-                display: 'flex',
+              <div key={msg.id} className="fade-in" style={{
+                alignSelf:     isMine ? 'flex-end' : 'flex-start',
+                maxWidth:      '85%',
+                display:       'flex',
                 flexDirection: 'column',
-                alignItems: isMine ? 'flex-end' : 'flex-start',
+                alignItems:    isMine ? 'flex-end' : 'flex-start',
               }}>
                 <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.2rem', marginLeft: '0.5rem', marginRight: '0.5rem' }}>
-                  {isMine ? 'You' : msg.sender_label} • {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  {isMine ? 'You' : msg.sender_label} &bull; {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
                 <div style={{
-                  backgroundColor: isMine ? 'var(--primary-color)' : '#f1f5f9',
-                  color: isMine ? 'white' : 'var(--text-primary)',
-                  padding: '0.75rem 1.25rem',
-                  borderRadius: '1.5rem',
-                  borderBottomRightRadius: isMine ? '0.25rem' : '1.5rem',
-                  borderBottomLeftRadius: !isMine ? '0.25rem' : '1.5rem',
-                  boxShadow: 'var(--shadow-sm)',
-                  wordBreak: 'break-word',
-                  lineHeight: '1.5'
+                  backgroundColor:       isMine ? 'var(--primary-color)' : '#f1f5f9',
+                  color:                 isMine ? 'white' : 'var(--text-primary)',
+                  padding:               '0.75rem 1.25rem',
+                  borderRadius:          '1.5rem',
+                  borderBottomRightRadius: isMine  ? '0.25rem' : '1.5rem',
+                  borderBottomLeftRadius:  !isMine ? '0.25rem' : '1.5rem',
+                  boxShadow:             'var(--shadow-sm)',
+                  wordBreak:             'break-word',
+                  lineHeight:            '1.5',
                 }}>
                   {msg.content}
                 </div>
               </div>
             );
           })}
-          
-          {otherTyping && (
-            <div className="fade-in" style={{ alignSelf: 'flex-start', marginLeft: '0.5rem', color: 'var(--text-secondary)', fontSize: '0.85rem', fontStyle: 'italic' }}>
-              Typing...
-            </div>
-          )}
         </div>
 
-        {/* Input Area */}
+        {/* Input area */}
         <form onSubmit={sendMessage} style={{ padding: '1rem', borderTop: '1px solid var(--border-color)', display: 'flex', gap: '0.5rem', backgroundColor: '#fff' }}>
-          <input 
-            type="text" 
-            value={input} 
-            onChange={handleTyping}
-            placeholder={connectionStatus === 'active' ? "Type your message..." : connectionStatus === 'waiting' ? "Waiting for peer..." : "Session closed"} 
-            style={{ margin: 0, flexGrow: 1, borderRadius: '9999px', padding: '0.75rem 1.5rem', border: '1px solid var(--border-color)' }} 
-            disabled={connectionStatus !== 'active'}
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={
+              connectionStatus === 'active'  ? 'Type your message...' :
+              connectionStatus === 'waiting' ? 'Waiting for peer...' : 'Session closed'
+            }
+            style={{ margin: 0, flexGrow: 1, borderRadius: '9999px', padding: '0.75rem 1.5rem', border: '1px solid var(--border-color)' }}
+            disabled={connectionStatus !== 'active' || sending}
           />
-          <button 
-            type="submit" 
-            disabled={connectionStatus !== 'active' || !input.trim()} 
-            style={{ borderRadius: '50%', width: '3rem', height: '3rem', padding: 0, flexShrink: 0, opacity: (connectionStatus !== 'active' || !input.trim()) ? 0.6 : 1 }}
+          <button
+            type="submit"
+            disabled={connectionStatus !== 'active' || !input.trim() || sending}
+            style={{ borderRadius: '50%', width: '3rem', height: '3rem', padding: 0, flexShrink: 0, opacity: (connectionStatus !== 'active' || !input.trim() || sending) ? 0.6 : 1 }}
           >
             &uarr;
           </button>

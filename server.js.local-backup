@@ -1,5 +1,9 @@
 'use strict';
 
+// Load .env.local before anything else — server.js is plain Node, not Next.js
+const { loadEnvConfig } = require('@next/env');
+loadEnvConfig(process.cwd());
+
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const next = require('next');
