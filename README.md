@@ -6,7 +6,7 @@
 [![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js&logoColor=white)](https://nextjs.org/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/atlas)
 [![Vercel](https://img.shields.io/badge/Deployed%20on-Vercel-black?logo=vercel)](https://vercel.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 
 > A safe, anonymous, and supportive platform where students can express themselves, access mental wellness tools, and connect with peer supporters — all in one place.
 
@@ -196,11 +196,6 @@ After running `reset-admin.js`:
 
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
 
 ---
 
